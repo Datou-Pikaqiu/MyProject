@@ -1,0 +1,27 @@
+# MasterProject - Smart Grid AI Alert Triage
+# 基础设施：消息队列 + 后续依赖
+services:
+  # NATS JetStream - Go/Python 之间的消息队列
+  # 论文价值：削峰填谷，防止告警风暴冲垮 LLM 后端
+  nats:
+    image: nats:2.10-alpine
+    container_name: masterproject-nats
+    ports:
+      - "4222:4222"  # 客户端连接端口（Go publisher / Python subscriber 都连这个）
+      - "8222:8222"  # HTTP 监控端口（浏览器可访问看状态）
+    command: >
+      -js
+      -sd /data
+      -m 8222
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  nats-data:
+    driver: local

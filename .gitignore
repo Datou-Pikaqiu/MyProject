@@ -1,0 +1,50 @@
+# ===== 数据集（不入库，太大且涉密）=====
+datasets/*
+!datasets/.gitkeep
+
+# ===== Go =====
+go-telemetry/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go-telemetry/vendor/
+
+# ===== Python =====
+ai-agent/.venv/
+ai-agent/__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# ===== 环境变量（防止泄露 API key）=====
+.env
+.env.local
+*.env
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Docker =====
+nats-data/
+
+# ===== Opencode 自带（不入项目库）=====
+.opencode/node_modules/
