@@ -4,32 +4,36 @@
 
 硕士论文工程：**Real-Time AI-Assisted Alert Triage for Smart-Grid Networks Using Go-Based Telemetry and Evidence-Grounded LLMs**。
 
-- 双轨架构：Go 快车道（毫秒级拦截 + 时窗聚合）+ Python 慢车道（RAG + 声明验证），NATS JetStream 解耦。
-- 技术栈：Go 1.25（`nats.go`）+ Python 3.12（`uv` + `ruff`）+ NATS JetStream（`nats:2.10-alpine`）。
-- 代码在 `go-telemetry/`（Go）和 `ai-agent/`（Python）。Day 1 已打通 Go→NATS→Python 管道，后续在现有骨架上扩展，优先遵循现有代码风格。
+- 双轨架构：Go 快车道（时窗聚合 + JetStream 发布）+ Python 慢车道（RAG + 声明验证），NATS JetStream 解耦。
+- 技术栈：Go 1.25（`nats.go`）+ Python 3.12（`uv` + `pydantic v2` + `ruff`）+ NATS JetStream（`nats:2.10-alpine`）。
+- 代码在 `go-telemetry/`（Go）和 `ai-agent/`（Python）。Day 3 已完成时窗聚合，当前进入 Sprint 2（LLM 接入）。
 
 ## 系统架构与数据流
 
 ```
-[PCAP/流量] -> Go(capture) -> Go(features) -> Go(aggregator)
-                                                    |
-                                              Go(producer)
-                                                    |  Publish: alerts.<severity>
-                                                [NATS JetStream]
-                                                    |  Subscribe: alerts.* (queue=ai-agent)
-                                           Python(consumer) -> Python(sanitizer)
-                                                    |
-                                           Python(rag) -> Python(llm) -> Python(verifier)
-                                                    |
-                                           Python(feedback) -> 分级工单 / 反向通知 Go
+[JSONL/PCAP] -> Go(capture) -> Go(aggregator) -> Go(producer)
+                                    |  时间窗口聚合 (5s / 10条阈值)
+                                    |  Publish: alerts.bundle.<severity>
+                              [NATS JetStream]
+                                    |  Subscribe: alerts.bundle.* (queue=ai-agent)
+                           Python(consumer) -> Python(sanitizer)
+                                    |
+                           Python(rag) -> Python(llm) -> Python(verifier)
+                                    |
+                           Python(feedback) -> 分级工单 / 反向通知 Go
 ```
 
-- **核心契约**：`AlertSnapshot`（Go struct / Python dict，JSON over NATS）。当前在 `main.go` / `main.py`，后续迁移到 `go-telemetry/pkg/contract/` 与 `ai-agent/src/ai_agent/consumer/`。
-- **NATS subject**：`alerts.<severity>`，severity ∈ {low, medium, high, critical}。Python 用 `alerts.*` 通配订阅，`queue="ai-agent"` 消费组实现削峰填谷。
+- **两个核心契约**（都在 `pkg/contract/` + `consumer/models.py`）：
+  - `AlertSnapshot`：单条告警（15 字段：基础元数据 + 上下文特征 + 设备状态 + 拓扑）
+  - `AlertContextBundle`：时窗聚合包（Day 3 新增，含去重 IP、最高严重度、风暴检测、根因节点）
+- **NATS subject**：
+  - `alerts.<severity>` — 单条告警（Day 1-2，目前 producer 不再用）
+  - `alerts.bundle.<severity>` — 聚合 Bundle（Day 3+，当前使用）
+  - stream 名 `ALERTS`，subjects=`["alerts.*", "alerts.bundle.*"]`，消费组 `queue="ai-agent"`
 - **三个创新点（导师关注，改动谨慎）**：
   1. 双重校验（`verifier/`）：LLM 输出 JSON + Python 硬编码强匹配溯源，0 幻觉弃权机制。
   2. Prompt 注入防护（`sanitizer/`）：外部输入只作只读数据块，永不作指令。
-  3. 时窗聚合降噪（`aggregator/`）：滑动窗口打包告警上下文快照，防告警风暴冲垮 LLM。
+  3. 时窗聚合降噪（`aggregator/` ✅ Day 3 已实现）：滑动窗口打包告警上下文快照，防告警风暴冲垮 LLM。
 
 ## 常用命令
 
@@ -37,49 +41,61 @@ workdir 为项目根（`Myproject/`）。
 
 ```bash
 # NATS
-docker compose -f deployments/docker-compose.yml up -d   # 启动（监控: http://localhost:8222）
-docker compose -f deployments/docker-compose.yml ps      # 状态
-docker compose -f deployments/docker-compose.yml down    # 停止
+docker compose -f deployments/docker-compose.yml up -d        # 启动（监控: http://localhost:8222）
+docker compose -f deployments/docker-compose.yml down         # 停止
+docker compose -f deployments/docker-compose.yml down -v      # 清空 JetStream 数据（改 stream 配置时用）
 
-# Go
-go run ./cmd/telemetry              # 运行 publisher
+# Go（workdir: go-telemetry/）
+go run ./cmd/telemetry --file ../datasets/synthetic_alerts.jsonl --interval 200ms
+# 可选参数：--window 5s（聚合窗口）--max-alerts 10（风暴阈值）
 go build -o bin/telemetry ./cmd/telemetry
-go test ./...                       # 测试
-go mod tidy                         # 整理依赖
+go test ./...
 
-# Python（只用 uv，不要用 pip）
-uv sync                             # 同步依赖
-uv run python -m ai_agent.main      # 运行 subscriber
-uv run pytest                       # 测试
-uv run ruff check src tests && uv run ruff format src tests  # lint + 格式化
+# Python（workdir: ai-agent/，只用 uv）
+uv sync                                    # 同步依赖
+uv run python -m ai_agent.main             # 运行 subscriber（订阅 Bundle）
+uv run python -m ai_agent.scripts.generate_alerts  # 生成合成数据
+uv run ruff check src tests && uv run ruff format src tests
 ```
 
-**端到端联调**：终端 1 起 NATS，终端 2 `uv run python -m ai_agent.main`，终端 3 `go run ./cmd/telemetry`，预期终端 2 打印 `[收到告警 #1]`。
+**端到端联调**：终端 1 起 NATS，终端 2 `uv run python -m ai_agent.main`，终端 3 `go run ./cmd/telemetry --file ../datasets/synthetic_alerts.jsonl --interval 200ms`，预期终端 2 打印 41 个 Bundle（含 1 个 `[STORM]`）。
 
 ## 目录结构
 
 ```
 Myproject/
-├── go-telemetry/                  # Go 快车道
-│   ├── cmd/telemetry/main.go      # 入口（NATS publisher）
-│   ├── internal/                  # capture/ features/ aggregator/ producer/（按 Sprint 填充）
-│   ├── pkg/contract/              # 跨语言契约（AlertSnapshot 等）
-│   └── go.mod                     # module 名 = masterproject（注意不是 go-telemetry）
-├── ai-agent/                      # Python 慢车道
-│   ├── src/ai_agent/              # main.py + consumer/ sanitizer/ rag/ llm/ verifier/ api/
+├── go-telemetry/
+│   ├── cmd/telemetry/main.go       # 入口（管道组装：读文件→聚合→发布）
+│   ├── internal/
+│   │   ├── aggregator/             # ✅ 时窗聚合器（Day 3）
+│   │   ├── producer/               # ✅ JetStream 发布（Day 3）
+│   │   ├── capture/                # 待实现（PCAP 重放）
+│   │   └── features/               # 待实现（特征提取）
+│   ├── pkg/contract/               # ✅ alert.go + bundle.go
+│   └── go.mod                      # module 名 = masterproject
+├── ai-agent/
+│   ├── src/ai_agent/
+│   │   ├── main.py                 # 入口（订阅 Bundle + 异步 LLM 分诊）
+│   │   ├── consumer/models.py      # ✅ AlertSnapshot + AlertContextBundle
+│   │   ├── llm/                    # ✅ LLM 分诊（Day 4）
+│   │   │   ├── models.py           #    TriageReport 分诊报告模型
+│   │   │   ├── prompts.py          #    提示词模板（系统/用户分离）
+│   │   │   └── client.py           #    DeepSeek API 异步客户端
+│   │   ├── scripts/generate_alerts.py  # ✅ 合成数据生成器
+│   │   ├── sanitizer/ rag/ verifier/ api/  # 待实现（Sprint 2-3）
 │   ├── tests/
-│   └── pyproject.toml             # uv + hatchling, py312, ruff line-length=100
-├── datasets/                      # SWaT 等，不入库，仅 .gitkeep
-├── deployments/docker-compose.yml # NATS JetStream
-├── docs/                          # 文档
-└── proto/                         # 预留 protobuf（当前用 JSON 契约）
+│   └── pyproject.toml              # uv + hatchling, py312, pydantic v2, ruff
+├── datasets/synthetic_alerts.jsonl # ✅ 合成数据（100 条，5 种攻击 + 风暴）
+├── deployments/docker-compose.yml  # NATS JetStream
+├── docs/  proto/                   # 预留
 ```
 
 ## 编码规范
 
 ### 数据契约（最高优先级）
 
-- `AlertSnapshot` 是 Go/Python **唯一权威契约**。改字段必须同步两端：Go struct tag ↔ Python dict key ↔ JSON 字段名三者一致。
+- `AlertSnapshot` 和 `AlertContextBundle` 是 Go/Python **唯一权威契约**。改字段必须同步两端：Go struct tag ↔ Python Pydantic field ↔ JSON 字段名三者一致。
+- Go 契约在 `pkg/contract/`（`alert.go` + `bundle.go`），Python 在 `consumer/models.py`。
 - Go 用 `json:"snake_case"` tag，Python 用 snake_case key，与现有 `alert_id`、`source_ip` 风格一致。
 - **不要单方面改契约**，否则管道断裂。
 
@@ -87,40 +103,54 @@ Myproject/
 
 - module 名是 `masterproject`（不是 `go-telemetry`），import path 写 `masterproject/internal/xxx`。
 - 私有逻辑放 `internal/`，契约放 `pkg/contract/`。错误处理用 `if err != nil`，不要 panic（`log.Fatalf` 仅限启动阶段）。
-- 并发用 goroutine + channel，context 要传递不要存 struct。
+- main.go 只负责管道组装，业务逻辑在 `internal/` 包里。
 
 ### Python
 
 - `src/` layout，包名 `ai_agent`。包管理**只用 uv**，不要用 pip/poetry/requirements.txt。
+- 数据模型用 Pydantic v2（`BaseModel`），JSON 解析用 `model_validate_json()`。
 - `ruff` 格式化，line-length=100（不是 88），target py312。提交前跑 `ruff check` + `ruff format`。
-- 类型注解必填（verifier 层尤其需要强类型）。异步入口用 `asyncio.run(main())`。
+- 类型注解必填。异步入口用 `asyncio.run(main())`。
 
-### NATS
+### NATS / JetStream
 
-- subject：`alerts.<severity>`。消费组固定 `queue="ai-agent"`，不要改。
-- Payload 统一 JSON（`json.Marshal` ↔ `json.loads`），不要用裸字符串。
-- `Publish` 后必须 `Flush()` 确认发出；subscriber 退出要 `nc.drain()`，不要直接 kill。
+- subject：`alerts.bundle.<severity>`（当前用）。消费组固定 `queue="ai-agent"`，不要改。
+- stream 名 `ALERTS`，subjects 必须包含 `alerts.*` 和 `alerts.bundle.*`。
+- JetStream publish 是同步的（有 ack），不需要 Flush。subscriber 退出要 `nc.drain()`。
+- 改 stream 配置后必须 `down -v` 清空 volume，否则旧配置残留。
 
 ## 禁止事项
 
-- 不要入库数据集（`datasets/` 已 gitignore，SWaT/CICICS2019 涉密且体积大）。
+- 不要入库数据集（`datasets/` 已 gitignore，SWaT 涉密）。
 - 不要提交 `.env` / API key / LLM token。
-- 不要升级核心依赖版本（Go 1.25、Python 3.12、NATS 2.10），除非用户明确要求。
-- 不要删 `verifier/` 和 `sanitizer/` 的架构位置——论文核心创新点，即便实现简单也要保留。
-- 不要在没 NATS 的情况下跑端到端（Go/Python 都依赖 `nats://localhost:4222`）。
+- 不要升级核心依赖版本（Go 1.25、Python 3.12、NATS 2.10）。
+- 不要删 `verifier/` 和 `sanitizer/` 的架构位置——论文核心创新点。
+- 不要在没 NATS 的情况下跑端到端。
 
 ## 验证要求
 
-- **改契约后**：`go build ./...` + `uv run python -c "import ai_agent"` + 端到端联调确认 NATS 消息能正确解析。
+- **改契约后**：`go build ./...` + `uv run python -c "from ai_agent.consumer.models import *"` + 端到端联调。
 - **改 Go 后**：`go build ./...` + `go test ./...` 通过。
 - **改 Python 后**：`uv run ruff check src tests` + `uv run pytest` 通过。
+- **改 aggregator/producer 后**：跑端到端联调，确认 Bundle 数和风暴检测正常。
 - **改 docker-compose 后**：`docker compose up -d` 能起，`http://localhost:8222/healthz` 返回 200。
-- **改 verifier/sanitizer 后**：必须有测试用例覆盖（幻觉拦截、注入防护），不能只靠手动验证。
-- 测试无法运行时（缺数据集/API key），在回复里说明原因，不要跳过验证。
+- 测试无法运行时（缺 API key 等），在回复里说明原因，不要跳过验证。
 
 ## 常见坑
 
-- **Go module 名是 `masterproject` 不是 `go-telemetry`**：import 路径写错会编译失败。
+- **Go module 名是 `masterproject`**：import 路径写 `go-telemetry/...` 会编译失败。
 - **NATS 必须先于 Go/Python 启动**：NATS 没起会直接 FatalError。
-- **Windows Python stdout 全缓冲**：长运行脚本要加 `sys.stdout.reconfigure(line_buffering=True)`，否则日志看不到。
-- **`internal/` 子目录目前是空骨架**：按 Sprint 填充，不是 bug。`datasets/` 和 `proto/` 同理目前为空。
+- **改 stream 配置要 `down -v`**：`docker compose down` 不删 volume，旧 stream 配置残留会导致新 subject 订阅失败。
+- **遗留 python 进程**：`uv run` 启动的 python 子进程可能不会被 `Stop-Process` 杀干净，多个 subscriber 在同一 queue group 会平分消息。用 `Get-Process python` 检查。
+- **Windows Python stdout 全缓冲**：长运行脚本要加 `sys.stdout.reconfigure(line_buffering=True)`。
+- **跨语言时间戳**：Go `time.Time` 要求 RFC 3339（带时区），Python 必须用 `datetime.now().astimezone()`，naive datetime 会被 Go 拒绝。
+
+## 研发阶段（对照提案）
+
+- [x] **Day 1**：Go→NATS→Python 管道打通（hello world AlertSnapshot）。
+- [x] **Day 2**：契约细化（15 字段）+ 合成数据生成器 + JetStream 持久化 + 持续流转验证。
+- [x] **Day 3**：时窗聚合器（`internal/aggregator/`）+ Go 代码重构（`internal/producer/`）+ AlertContextBundle + 风暴检测。
+- [x] **Day 4**：LLM 接入（DeepSeek API + JSON Mode）+ TriageReport 分诊报告模型 + 提示词模板（系统/用户分离，防注入基础）+ 异步分诊（Semaphore 并发控制）。端到端验证：100 条告警 → 41 Bundle → 41 分诊报告，LLM 完美识别 DDoS 攻击（malicious/ddos/block/0.95）。
+- [ ] **Sprint 2（Day 5-15）**：RAG 知识库 + verifier 声明验证层 + 提示词优化。
+- [ ] **Sprint 3（Day 16-21）**：声明验证层（verifier 硬编码强匹配）+ Prompt 注入对抗 + 对比/消融实验。
+- [ ] **Day 22-25**：实验数据整理 + 论文图表。

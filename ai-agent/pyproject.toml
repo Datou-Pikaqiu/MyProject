@@ -7,6 +7,10 @@ dependencies = [
     # NATS 客户端：从 Go 端消费告警快照
     "nats-py>=2.7.0",
     "pydantic>=2.13.4",
+    # LLM 客户端：DeepSeek API（OpenAI 兼容 SDK）
+    "openai>=1.0.0",
+    # 环境变量管理：从 .env 加载 API key
+    "python-dotenv>=1.0.0",
 ]
 
 [build-system]
