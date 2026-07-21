@@ -73,3 +73,44 @@ class AlertSnapshot(BaseModel):
     def subject(self) -> str:
         """该告警应该发布到的 NATS subject：alerts.<severity>。"""
         return f"alerts.{self.severity.value}"
+
+
+class AlertContextBundle(BaseModel):
+    """告警上下文包——时窗聚合后的产物。
+
+    对应 Go 端 go-telemetry/pkg/contract/bundle.go。
+    Go 端把一个时间窗口内的多条告警打包成一个 Bundle 发过来，
+    避免 100 条告警逐条冲垮 LLM。
+
+    LLM 收到 Bundle 后能看到完整上下文：
+    - 过去 N 秒内收到了多少条告警
+    - 涉及哪些 IP / 协议
+    - 最高严重度 / 是否是告警风暴
+    - 风暴中心节点（根因分析线索）
+    """
+
+    bundle_id: str
+    window_start: datetime
+    window_end: datetime
+    alert_count: int
+
+    # 窗口内的告警列表
+    alerts: list[AlertSnapshot]
+
+    # 去重后的统计信息
+    source_ips: list[str]
+    dest_ips: list[str]
+    protocols: list[str]
+    max_severity: Severity
+    avg_packet_rate: float = Field(default=0.0, description="平均包速率")
+    total_failed_conn: int = Field(default=0, description="总连接失败次数")
+
+    # 告警风暴检测（提案核心创新点）
+    is_alert_storm: bool = Field(default=False, description="告警数 >= 阈值时为 true")
+    storm_node_id: str = Field(default="", description="风暴中心节点")
+    subnet: str = Field(default="", description="主要子网")
+
+    @property
+    def subject(self) -> str:
+        """该 Bundle 应该发布到的 NATS subject：alerts.bundle.<max_severity>。"""
+        return f"alerts.bundle.{self.max_severity.value}"

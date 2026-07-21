@@ -1,7 +1,9 @@
 // Package main 是 Go 遥测服务的入口。
 //
-// Day 2：从 JSONL 文件读取合成告警，用 JetStream 持久化发布到 NATS。
-// JetStream 保证消息不丢（core NATS 是 fire-and-forget，会丢消息）。
+// Day 3：管道组装 = 读 JSONL → 时窗聚合 → JetStream 发布 Bundle
+// main.go 只负责组装管道，逻辑拆到 internal/ 包里：
+//   - internal/aggregator/ 时窗聚合（提案创新点）
+//   - internal/producer/   JetStream 发布
 package main
 
 import (
@@ -13,98 +15,82 @@ import (
 	"os"
 	"time"
 
-	"github.com/nats-io/nats.go"
+	"masterproject/internal/aggregator"
+	"masterproject/internal/producer"
 	"masterproject/pkg/contract"
 )
 
-// streamName 是 JetStream stream 的名称，Go/Python 两端必须一致。
-const streamName = "ALERTS"
-
 func main() {
 	filePath := flag.String("file", "../datasets/synthetic_alerts.jsonl", "JSONL 告警文件路径")
-	interval := flag.Duration("interval", 200*time.Millisecond, "发送间隔（如 200ms, 1s）")
+	interval := flag.Duration("interval", 200*time.Millisecond, "发送间隔")
+	windowSize := flag.Duration("window", 5*time.Second, "聚合窗口时长")
+	maxAlerts := flag.Int("max-alerts", 10, "窗口最大告警数（达到则触发风暴标记）")
 	flag.Parse()
 
-	// 1. 连接 NATS
-	nc, err := nats.Connect(nats.DefaultURL)
+	// 1. 创建 Producer（连接 NATS + 确保 stream）
+	p, err := producer.NewProducer("nats://localhost:4222")
 	if err != nil {
-		log.Fatalf("[X] 连接 NATS 失败: %v", err)
+		log.Fatalf("[X] 创建 Producer 失败: %v", err)
 	}
-	defer nc.Close()
-	fmt.Printf("[OK] Go publisher 已连接 NATS，间隔 %v\n", *interval)
+	defer p.Close()
+	fmt.Printf("[OK] Producer 就绪，窗口 %v / 风暴阈值 %d 条\n", *windowSize, *maxAlerts)
 
-	// 2. 创建 JetStream context
-	js, err := nc.JetStream()
-	if err != nil {
-		log.Fatalf("[X] 创建 JetStream context 失败: %v", err)
-	}
+	// 2. 创建聚合器
+	agg := aggregator.NewAggregator(*windowSize, *maxAlerts)
 
-	// 3. 确保 stream 存在（幂等：已存在则跳过）
-	// stream 持久化存储 subject 匹配 alerts.* 的所有消息
-	if _, err := js.StreamInfo(streamName); err != nil {
-		_, err = js.AddStream(&nats.StreamConfig{
-			Name:      streamName,
-			Subjects:  []string{"alerts.*"},
-			Retention: nats.LimitsPolicy, // 超过限制时丢弃旧消息
-			MaxAge:    time.Hour,         // 消息保留 1 小时
-		})
-		if err != nil {
-			log.Fatalf("[X] 创建 stream %s 失败: %v", streamName, err)
-		}
-		fmt.Printf("[OK] 已创建 JetStream stream: %s\n", streamName)
-	} else {
-		fmt.Printf("[OK] JetStream stream 已存在: %s\n", streamName)
-	}
-
-	// 4. 打开 JSONL 文件
+	// 3. 打开 JSONL 文件
 	file, err := os.Open(*filePath)
 	if err != nil {
 		log.Fatalf("[X] 打开文件失败: %v", err)
 	}
 	defer file.Close()
 
-	// 5. 逐行读取并用 JetStream 发布
+	// 4. 逐行读取 → 聚合 → 发布
 	scanner := bufio.NewScanner(file)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
-	sent := 0
-	bySeverity := map[string]int{}
+	totalAlerts := 0     // 读取的告警总数
+	bundlesSent := 0     // 发送的 Bundle 数
+	stormBundles := 0    // 风暴 Bundle 数
 	startTime := time.Now()
 
 	for scanner.Scan() {
-		line := scanner.Bytes()
-
 		var alert contract.AlertSnapshot
-		if err := json.Unmarshal(line, &alert); err != nil {
-			log.Printf("[!] 第 %d 行解析失败: %v", sent+1, err)
+		if err := json.Unmarshal(scanner.Bytes(), &alert); err != nil {
+			log.Printf("[!] 解析失败: %v", err)
 			continue
 		}
 
-		data, err := json.Marshal(alert)
-		if err != nil {
-			log.Printf("[!] 序列化失败 %s: %v", alert.AlertID, err)
-			continue
-		}
+		totalAlerts++
 
-		subject := alert.Subject()
-		// JetStream Publish 是同步的，返回 ack 确认消息已持久化
-		// （core NATS 的 Publish 是异步 fire-and-forget，不保证不丢）
-		_, err = js.Publish(subject, data)
-		if err != nil {
-			log.Printf("[!] 发布失败 %s: %v", alert.AlertID, err)
-			continue
-		}
-
-		sent++
-		bySeverity[alert.Severity]++
-
-		if sent == 1 || sent%10 == 0 || alert.Severity == contract.SeverityCritical {
-			fmt.Printf("[发送 %3d] %-16s -> %-14s | %-8s | %s\n",
-				sent, alert.AlertID, subject, alert.Severity,
-				truncate(alert.RawMessage, 35))
+		// 加入聚合器，返回非 nil 表示触发了聚合
+		bundle := agg.Add(alert)
+		if bundle != nil {
+			if err := p.PublishBundle(bundle); err != nil {
+				log.Printf("[!] 发布 Bundle 失败: %v", err)
+			} else {
+				bundlesSent++
+				if bundle.IsAlertStorm {
+					stormBundles++
+				}
+				printBundle(bundlesSent, bundle)
+			}
 		}
 
 		time.Sleep(*interval)
+	}
+
+	// 5. 文件读完，Flush 剩余告警
+	if bundle := agg.Flush(); bundle != nil {
+		if err := p.PublishBundle(bundle); err != nil {
+			log.Printf("[!] 发布最后 Bundle 失败: %v", err)
+		} else {
+			bundlesSent++
+			if bundle.IsAlertStorm {
+				stormBundles++
+			}
+			printBundle(bundlesSent, bundle)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -113,16 +99,22 @@ func main() {
 
 	// 6. 统计
 	elapsed := time.Since(startTime)
-	fmt.Printf("\n[完成] 共发送 %d 条告警，耗时 %v\n", sent, elapsed.Round(time.Millisecond))
-	fmt.Printf("     按严重度: %v\n", bySeverity)
-	fmt.Printf("     平均速率: %.1f 条/秒\n", float64(sent)/elapsed.Seconds())
+	fmt.Printf("\n[完成] 读取 %d 条告警 → 聚合成 %d 个 Bundle（含 %d 个风暴）\n",
+		totalAlerts, bundlesSent, stormBundles)
+	fmt.Printf("     耗时 %v，平均 %.1f 告警/秒\n",
+		elapsed.Round(time.Millisecond), float64(totalAlerts)/elapsed.Seconds())
 }
 
-// truncate 截断字符串到指定 rune 数，避免中文被截断成乱码。
-func truncate(s string, n int) string {
-	r := []rune(s)
-	if len(r) > n {
-		return string(r[:n]) + "..."
+// printBundle 打印 Bundle 发送日志。
+func printBundle(seq int, b *contract.AlertContextBundle) {
+	storm := ""
+	if b.IsAlertStorm {
+		storm = " [STORM]"
 	}
-	return s
+	fmt.Printf("[Bundle %3d] %s | %d 条告警 | %-8s | 源IP:%d 目的IP:%d | 窗口 %v%s\n",
+		seq, b.BundleID, b.AlertCount, b.MaxSeverity,
+		len(b.SourceIPs), len(b.DestIPs),
+		b.WindowEnd.Sub(b.WindowStart).Round(time.Millisecond),
+		storm,
+	)
 }
