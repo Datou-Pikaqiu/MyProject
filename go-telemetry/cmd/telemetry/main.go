@@ -1,88 +1,128 @@
 // Package main 是 Go 遥测服务的入口。
 //
-// Day 1 目标：验证 Go -> NATS 管道打通。
-// 后续这里会演化成：流量重放 -> 特征提取 -> 时窗聚合 -> 队列投递。
+// Day 2：从 JSONL 文件读取合成告警，用 JetStream 持久化发布到 NATS。
+// JetStream 保证消息不丢（core NATS 是 fire-and-forget，会丢消息）。
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"masterproject/pkg/contract"
 )
 
-// AlertSnapshot 是 Go 端发给 Python 端的"告警上下文快照"。
-//
-// 这是整个系统的核心数据契约 —— Go 和 Python 之间传递的最小信息单元。
-// 提案第 4 节定义了 LLM 可用的证据字段，这个结构是它的起点。
-// Day 1 先放最基础字段，后续 Sprint 会扩展：
-//   - 拓扑信息（节点角色、上下游关系）
-//   - 时窗统计（过去 5 分钟连接失败次数、异常载荷长度）
-//   - 设备状态（PLC 控制器、HMI 操作站等资产角色）
-type AlertSnapshot struct {
-	AlertID    string    `json:"alert_id"`
-	Timestamp  time.Time `json:"timestamp"`
-	SourceIP   string    `json:"source_ip"`
-	DestIP     string    `json:"dest_ip"`
-	Port       int       `json:"port"`
-	Protocol   string    `json:"protocol"`   // 如 "Modbus", "DNP3"
-	Severity   string    `json:"severity"`   // low / medium / high / critical
-	RawMessage string    `json:"raw_message"` // 原始告警文本（后面要做注入防护）
-}
+// streamName 是 JetStream stream 的名称，Go/Python 两端必须一致。
+const streamName = "ALERTS"
 
 func main() {
-	// 1. 连接 NATS（默认地址 nats://localhost:4222）
+	filePath := flag.String("file", "../datasets/synthetic_alerts.jsonl", "JSONL 告警文件路径")
+	interval := flag.Duration("interval", 200*time.Millisecond, "发送间隔（如 200ms, 1s）")
+	flag.Parse()
+
+	// 1. 连接 NATS
 	nc, err := nats.Connect(nats.DefaultURL)
 	if err != nil {
 		log.Fatalf("[X] 连接 NATS 失败: %v", err)
 	}
 	defer nc.Close()
-	fmt.Println("[OK] Go publisher 已连接 NATS")
+	fmt.Printf("[OK] Go publisher 已连接 NATS，间隔 %v\n", *interval)
 
-	// 2. 构造一个模拟的告警快照
-	// Day 3 会用真实流量重放替换这里
-	snapshot := AlertSnapshot{
-		AlertID:    "alert-001",
-		Timestamp:  time.Now(),
-		SourceIP:   "192.168.1.100",
-		DestIP:     "192.168.1.50",
-		Port:       502, // Modbus 默认端口
-		Protocol:   "Modbus",
-		Severity:   "high",
-		RawMessage: "异常 Modbus 写入：未授权节点尝试修改 PLC 寄存器",
-	}
-
-	// 3. 序列化为 JSON
-	// NATS 传字节，我们用 JSON 作为跨语言契约（Go struct tag <-> Python dict）
-	data, err := json.Marshal(snapshot)
+	// 2. 创建 JetStream context
+	js, err := nc.JetStream()
 	if err != nil {
-		log.Fatalf("[X] JSON 序列化失败: %v", err)
+		log.Fatalf("[X] 创建 JetStream context 失败: %v", err)
 	}
 
-	// 4. 发布到 NATS
-	// subject 命名规范: alerts.<severity>
-	// 设计意图：Python 端可按严重度选择性订阅
-	//   - alerts.*          接收全部
-	//   - alerts.critical   只接收致命告警（高优处理）
-	subject := "alerts." + snapshot.Severity
-	err = nc.Publish(subject, data)
+	// 3. 确保 stream 存在（幂等：已存在则跳过）
+	// stream 持久化存储 subject 匹配 alerts.* 的所有消息
+	if _, err := js.StreamInfo(streamName); err != nil {
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:      streamName,
+			Subjects:  []string{"alerts.*"},
+			Retention: nats.LimitsPolicy, // 超过限制时丢弃旧消息
+			MaxAge:    time.Hour,         // 消息保留 1 小时
+		})
+		if err != nil {
+			log.Fatalf("[X] 创建 stream %s 失败: %v", streamName, err)
+		}
+		fmt.Printf("[OK] 已创建 JetStream stream: %s\n", streamName)
+	} else {
+		fmt.Printf("[OK] JetStream stream 已存在: %s\n", streamName)
+	}
+
+	// 4. 打开 JSONL 文件
+	file, err := os.Open(*filePath)
 	if err != nil {
-		log.Fatalf("[X] 发布失败: %v", err)
+		log.Fatalf("[X] 打开文件失败: %v", err)
+	}
+	defer file.Close()
+
+	// 5. 逐行读取并用 JetStream 发布
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	sent := 0
+	bySeverity := map[string]int{}
+	startTime := time.Now()
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		var alert contract.AlertSnapshot
+		if err := json.Unmarshal(line, &alert); err != nil {
+			log.Printf("[!] 第 %d 行解析失败: %v", sent+1, err)
+			continue
+		}
+
+		data, err := json.Marshal(alert)
+		if err != nil {
+			log.Printf("[!] 序列化失败 %s: %v", alert.AlertID, err)
+			continue
+		}
+
+		subject := alert.Subject()
+		// JetStream Publish 是同步的，返回 ack 确认消息已持久化
+		// （core NATS 的 Publish 是异步 fire-and-forget，不保证不丢）
+		_, err = js.Publish(subject, data)
+		if err != nil {
+			log.Printf("[!] 发布失败 %s: %v", alert.AlertID, err)
+			continue
+		}
+
+		sent++
+		bySeverity[alert.Severity]++
+
+		if sent == 1 || sent%10 == 0 || alert.Severity == contract.SeverityCritical {
+			fmt.Printf("[发送 %3d] %-16s -> %-14s | %-8s | %s\n",
+				sent, alert.AlertID, subject, alert.Severity,
+				truncate(alert.RawMessage, 35))
+		}
+
+		time.Sleep(*interval)
 	}
 
-	// 5. 刷新确保消息发出（NATS Publish 是异步的，Flush 同步等待）
-	err = nc.Flush()
-	if err != nil {
-		log.Fatalf("[X] Flush 失败: %v", err)
+	if err := scanner.Err(); err != nil {
+		log.Printf("[!] 读取文件错误: %v", err)
 	}
 
-	// 6. 打印发布结果（方便验证）
-	fmt.Printf("[OK] 已发布告警到 subject [%s]\n", subject)
-	fmt.Printf("     AlertID:  %s\n", snapshot.AlertID)
-	fmt.Printf("     源->目的: %s -> %s:%d\n", snapshot.SourceIP, snapshot.DestIP, snapshot.Port)
-	fmt.Printf("     协议:     %s\n", snapshot.Protocol)
-	fmt.Printf("     严重度:   %s\n", snapshot.Severity)
-	fmt.Printf("     Payload:  %d bytes\n", len(data))
+	// 6. 统计
+	elapsed := time.Since(startTime)
+	fmt.Printf("\n[完成] 共发送 %d 条告警，耗时 %v\n", sent, elapsed.Round(time.Millisecond))
+	fmt.Printf("     按严重度: %v\n", bySeverity)
+	fmt.Printf("     平均速率: %.1f 条/秒\n", float64(sent)/elapsed.Seconds())
+}
+
+// truncate 截断字符串到指定 rune 数，避免中文被截断成乱码。
+func truncate(s string, n int) string {
+	r := []rune(s)
+	if len(r) > n {
+		return string(r[:n]) + "..."
+	}
+	return s
 }

@@ -6,6 +6,7 @@ requires-python = ">=3.12"
 dependencies = [
     # NATS 客户端：从 Go 端消费告警快照
     "nats-py>=2.7.0",
+    "pydantic>=2.13.4",
 ]
 
 [build-system]

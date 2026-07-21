@@ -1,58 +1,101 @@
-"""AI Agent - Hello World Subscriber.
+"""AI Agent - Subscriber（Day 2 版本，JetStream 持久化消费）。
 
-Day 1 目标：验证 NATS -> Python 管道打通。
-从 NATS 接收 Go 端发来的告警快照，解析并打印。
-
-后续这里会演化成：
-  NATS 消费 -> 日志清洗/注入防护 -> RAG 检索 -> LLM 推理 -> 双重验证 -> 工单输出
+用 JetStream 代替 core NATS 订阅，确保消息不丢：
+  - core NATS：fire-and-forget，subscriber 没及时收就丢
+  - JetStream：消息持久化到磁盘，subscriber 断线重连后能收到未读消息
 """
+
+from __future__ import annotations
+
 import asyncio
-import json
 import sys
+from collections import defaultdict
+from datetime import datetime
 
 # Windows 下 stdout 重定向到文件时默认全缓冲，强制行缓冲让日志实时可见
 sys.stdout.reconfigure(line_buffering=True)
 
+# JetStream stream 名称，必须和 Go 端一致
+STREAM_NAME = "ALERTS"
+
 
 async def main() -> None:
-    # 延迟导入 nats，让上面的 docstring 在缺依赖时也能看
     import nats
+
+    from ai_agent.consumer.models import AlertSnapshot
 
     # 1. 连接 NATS
     nc = await nats.connect("nats://localhost:4222")
     print("[OK] Python subscriber 已连接 NATS")
 
-    received_count = 0
+    # 2. 创建 JetStream context + 确保 stream 存在
+    js = nc.jetstream()
+    try:
+        await js.stream_info(STREAM_NAME)
+        print(f"[OK] JetStream stream 已存在: {STREAM_NAME}")
+    except Exception:
+        try:
+            await js.add_stream(name=STREAM_NAME, subjects=["alerts.*"])
+            print(f"[OK] 已创建 JetStream stream: {STREAM_NAME}")
+        except Exception:
+            # Go 端可能已经创建了，忽略错误
+            print(f"[OK] stream {STREAM_NAME} 已被 Go 端创建")
 
-    # 2. 定义收到消息的回调
+    # 3. 统计计数器
+    received = 0
+    by_severity: dict[str, int] = defaultdict(int)
+    start_time = datetime.now()
+    last_stat_time = start_time
+
+    # 4. 消息回调（JetStream 自动 ack：回调完成后自动确认消息）
     async def on_message(msg) -> None:
-        nonlocal received_count
-        received_count += 1
+        nonlocal received, last_stat_time
+        received += 1
 
-        # 解析 JSON（Go 端 Marshal 的结构 <-> Python dict）
-        data = json.loads(msg.data.decode("utf-8"))
+        try:
+            alert = AlertSnapshot.model_validate_json(msg.data)
+        except Exception as e:
+            print(f"[!] 解析失败 (subject={msg.subject}): {e}")
+            return  # 不 ack，消息会被重新投递
 
-        print(f"\n[收到告警 #{received_count}] subject: {msg.subject}")
-        print(f"  AlertID:  {data['alert_id']}")
-        print(f"  时间:     {data['timestamp']}")
-        print(f"  源->目的: {data['source_ip']} -> {data['dest_ip']}:{data['port']}")
-        print(f"  协议:     {data['protocol']}")
-        print(f"  严重度:   {data['severity']}")
-        print(f"  原始消息: {data['raw_message']}")
+        by_severity[alert.severity.value] += 1
 
-    # 3. 订阅 alerts.* （通配符，接收所有严重度的告警）
-    # queue="ai-agent" 表示消费组：
-    #   后续起多个 AI worker 时，同一条告警只会被一个 worker 消费（负载均衡）
-    #   这是"削峰填谷"的关键 —— 提案第 2 节
-    await nc.subscribe("alerts.*", cb=on_message, queue="ai-agent")
-    print("[OK] 已订阅 alerts.* ，等待 Go 端发布告警...")
-    print("     (按 Ctrl+C 退出)")
+        # 详细输出 critical/high，简要输出其他（避免正常流量刷屏）
+        sev = alert.severity.value
+        if sev in ("critical", "high"):
+            msg_short = alert.raw_message[:40] + ("..." if len(alert.raw_message) > 40 else "")
+            print(
+                f"[#{received:3d}] {alert.alert_id:20s} | {sev:8s} | "
+                f"{alert.source_ip} -> {alert.dest_ip} | {msg_short}"
+            )
 
-    # 4. 保持运行，直到被中断
+        # 每 10 条打印一次速率统计
+        if received % 10 == 0:
+            now = datetime.now()
+            elapsed = (now - last_stat_time).total_seconds()
+            rate = 10 / elapsed if elapsed > 0 else 0
+            print(
+                f"  --- 已接收 {received:3d} 条 | "
+                f"最近 10 条 {rate:.1f} 条/秒 | 分布: {dict(by_severity)}"
+            )
+            last_stat_time = now
+
+    # 5. 用 JetStream 订阅（持久化消费，消息不丢）
+    # queue="ai-agent" 消费组：多 worker 负载均衡
+    # manual_ack 默认 False：回调完成后自动 ack
+    await js.subscribe("alerts.*", cb=on_message, queue="ai-agent")
+    print("[OK] 已订阅 alerts.* (JetStream)，等待告警...")
+    print("     (按 Ctrl+C 退出)\n")
+
+    # 6. 保持运行
     try:
         await asyncio.Event().wait()
     except (KeyboardInterrupt, asyncio.CancelledError):
-        print("\n[退出] 正在关闭 NATS 连接...")
+        elapsed = (datetime.now() - start_time).total_seconds()
+        print(f"\n[退出] 共接收 {received} 条，耗时 {elapsed:.1f}s")
+        print(f"       按严重度: {dict(by_severity)}")
+        if elapsed > 0:
+            print(f"       平均速率: {received / elapsed:.1f} 条/秒")
         await nc.drain()
 
 
