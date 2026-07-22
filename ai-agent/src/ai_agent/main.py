@@ -51,6 +51,16 @@ if "--exit-after-bundles" in sys.argv:
     EXIT_AFTER_BUNDLES = int(sys.argv[idx + 1])
     print(f"[实验模式] 收到 {EXIT_AFTER_BUNDLES} 个 Bundle 后自动退出")
 
+# 消融实验开关
+# --no-rag       跳过 RAG 检索（对比有/无领域知识）
+# --no-verifier  跳过 verifier 验证（对比有/无幻觉检测）
+NO_RAG = "--no-rag" in sys.argv
+NO_VERIFIER = "--no-verifier" in sys.argv
+if NO_RAG:
+    print("[消融] RAG 已禁用")
+if NO_VERIFIER:
+    print("[消融] Verifier 已禁用")
+
 
 async def main() -> None:
     import nats
@@ -110,13 +120,12 @@ async def main() -> None:
                     print(f"    {r}")
 
             # === RAG 知识检索（Day 7 核心新增）===
-            rag_context = retriever.retrieve(sanitized_bundle)
-            metrics.record_rag(rag_context.document_count)
-            if rag_context.documents:
-                print(f"  {rag_context}")
-
-            print(f"\n[Bundle #{bundle_num}] 开始 LLM 分诊...")
-            rag_block = rag_context.to_prompt_block() if rag_context.documents else None
+            rag_context = retriever.retrieve(sanitized_bundle) if not NO_RAG else None
+            if not NO_RAG:
+                metrics.record_rag(rag_context.document_count)
+                if rag_context.documents:
+                    print(f"  {rag_context}")
+            rag_block = rag_context.to_prompt_block() if (rag_context and rag_context.documents) else None
             t0 = time.monotonic()
             report = await llm_client.triage(sanitized_bundle, rag_context=rag_block)
 
@@ -125,46 +134,52 @@ async def main() -> None:
                 return
 
             latency_ms = (time.monotonic() - t0) * 1000
-            metrics.record_llm_call(prompt_tokens=0, completion_tokens=0, latency_ms=latency_ms)
+            metrics.record_llm_call(
+                prompt_tokens=llm_client.last_prompt_tokens,
+                completion_tokens=llm_client.last_completion_tokens,
+                latency_ms=latency_ms,
+            )
             metrics.record_classification(report.classification.value)
 
             # === verifier 验证（Day 5 核心新增）===
             # 用净化后的 Bundle 验证（LLM 只能引用净化后的数据）
-            result = verifier.verify(report, sanitized_bundle)
-
-            if result.is_valid:
-                # 验证通过 → 输出报告
-                metrics.record_verifier(True)
-                print(f"\n{'=' * 60}")
-                print(f"[分诊报告-已验证] Bundle #{bundle_num} ({bundle.bundle_id})")
-                print(f"{'=' * 60}")
-                print(f"  分类:     {report.classification.value}")
-                print(f"  攻击类型: {report.attack_type.value}")
-                print(f"  置信度:   {report.confidence:.2f}")
-                print(f"  处置:     {report.recommended_action.value}")
-                print(f"  推理:     {report.reasoning}")
-                print(f"  证据 ({len(result.matched)}/{result.total_evidence} 已验证):")
-                for ev in report.evidence:
-                    print(f"    [OK] {ev}")
-                if report.severity_override:
-                    print(f"  严重度覆盖: {report.severity_override}")
-                print(f"{'=' * 60}")
+            if not NO_VERIFIER:
+                result = verifier.verify(report, sanitized_bundle)
+                if result.is_valid:
+                    metrics.record_verifier(True)
+                    tag = "已验证"
+                else:
+                    metrics.record_verifier(False)
+                    tag = f"弃权({len(result.mismatched)}幻觉)"
             else:
-                # 验证失败 → 弃权（0 幻觉机制）
-                metrics.record_verifier(False)
-                print(f"\n{'=' * 60}")
-                print(f"[弃权-检测到幻觉] Bundle #{bundle_num} ({bundle.bundle_id})")
-                print(f"{'=' * 60}")
-                print(f"  匹配:     {len(result.matched)}/{result.total_evidence}")
-                print(f"  匹配率:   {result.match_rate:.2f}")
-                print("  真实证据:")
-                for m in result.matched:
-                    print(f"    [OK] {m}")
-                print("  幻觉证据:")
-                for m in result.mismatched:
-                    print(f"    [!] {m}")
-                print("  (报告被弃权，不输出给操作员)")
-                print(f"{'=' * 60}")
+                tag = "跳过(消融)"
+                metrics.record_verifier(True)  # 消融模式下默认通过
+
+            # 打印分诊报告（统一出口）
+            print(f"\n{'=' * 60}")
+            print(f"[分诊报告-{tag}] Bundle #{bundle_num} ({report.bundle_id})")
+            print(f"{'=' * 60}")
+            print(f"  分类:     {report.classification.value}")
+            print(f"  攻击类型: {report.attack_type.value}")
+            print(f"  置信度:   {report.confidence:.2f}")
+            print(f"  处置:     {report.recommended_action.value}")
+            print(f"  推理:     {report.reasoning}")
+            if not NO_VERIFIER:
+                print(f"  证据 ({len(result.matched)}/{result.total_evidence} {tag}):")
+                for ev in report.evidence:
+                    mark = "[OK]" if ev in result.matched else "[!]"
+                    print(f"    {mark} {ev}")
+                if result.mismatched:
+                    print("  幻觉证据:")
+                    for m in result.mismatched:
+                        print(f"    [!] {m}")
+            else:
+                print("  证据:")
+                for ev in report.evidence:
+                    print(f"    {ev}")
+            if report.severity_override:
+                print(f"  严重度覆盖: {report.severity_override}")
+            print(f"{'=' * 60}")
 
     # 6. 消息回调（收到 Bundle 后异步启动 LLM 分诊 + verifier）
     async def on_message(msg) -> None:

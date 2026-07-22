@@ -38,6 +38,8 @@ class LLMClient:
         report = await client.triage(bundle)
         if report:
             print(f"分类: {report.classification}, 置信度: {report.confidence}")
+            # token 使用量通过 last_prompt_tokens / last_completion_tokens 读取
+            metrics.record_llm_call(client.last_prompt_tokens, client.last_completion_tokens, ...)
     """
 
     def __init__(self) -> None:
@@ -54,6 +56,10 @@ class LLMClient:
         self.model = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+
+        # 最近一次调用的 token 使用量（调用方在 await triage() 后立即读取）
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
 
     async def triage(
         self, bundle: "AlertContextBundle", rag_context: str | None = None
@@ -90,11 +96,16 @@ class LLMClient:
 
             # 记录 token 使用量（论文实验需要统计成本）
             if response.usage:
+                self.last_prompt_tokens = response.usage.prompt_tokens
+                self.last_completion_tokens = response.usage.completion_tokens
                 print(
-                    f"  [LLM] tokens: prompt={response.usage.prompt_tokens}, "
-                    f"completion={response.usage.completion_tokens}, "
+                    f"  [LLM] tokens: prompt={self.last_prompt_tokens}, "
+                    f"completion={self.last_completion_tokens}, "
                     f"total={response.usage.total_tokens}"
                 )
+            else:
+                self.last_prompt_tokens = 0
+                self.last_completion_tokens = 0
 
             # 用 Pydantic 严格校验 JSON（字段缺失/类型错误会抛 ValidationError）
             report = TriageReport.model_validate_json(content)

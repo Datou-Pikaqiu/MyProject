@@ -55,6 +55,9 @@ go test ./...
 uv sync                                    # 同步依赖
 uv run python -m ai_agent.main             # 运行 subscriber（订阅 Bundle，Ctrl+C 退出）
 uv run python -m ai_agent.main --exit-after-bundles=41  # 实验模式：收 41 Bundle 后自动退出 + 打印指标
+uv run python -m ai_agent.main --exit-after-bundles=41 --no-rag       # 消融：无 RAG
+uv run python -m ai_agent.main --exit-after-bundles=41 --no-verifier  # 消融：无 Verifier
+uv run python scripts/run_ablation.py               # 一键跑全部消融实验
 uv run python -m ai_agent.scripts.generate_alerts  # 生成合成数据
 uv run ruff check src tests; uv run ruff format src tests
 uv run python tests/test_verifier.py       # verifier 单测
@@ -171,4 +174,5 @@ Myproject/
 - [x] **Day 6**：sanitizer 注入防护（论文创新点2）+ 5 类注入模式（中英双语）× 23 条正则 + 占位符替换。端到端验证：3 条注入告警全被检测（instruction_override / role_hijacking / jailbreak），净化后 LLM 无法被注入操控。
 - [x] **Day 7**：RAG 知识库 + 10 条电网安全领域文档 + 关键词标签检索 + Top-K 注入 prompt。端到端验证：41/41 Bundle 全部检索到领域知识，LLM 推理引用"工程站安全""Modbus 协议"等专业知识。
 - [x] **Day 8**：metrics 指标采集模块 + 结构化报表（文本/JSON）+ NATS 管道完整实验。100 条告警 → 41 Bundle（压缩比 2.4:1，降噪 59%），LLM 平均延迟 1892ms，verifier 弃权率 2.4%（1/41），RAG 命中率 3.0 条/Bundle。新增 `--exit-after-bundles=N` 实验模式。
-- [ ] **Day 9+**：SWaT 数据实验 + 论文图表 + 终稿。
+- [x] **Day 9**：修复 LLM token 追踪（`client.last_*_tokens`）+ 消融实验框架（`--no-rag` / `--no-verifier`）+ 自动运行器 `scripts/run_ablation.py`（串行 3 组实验 → 对比表 + JSON）。
+- [ ] **Day 10+**：SWaT 数据实验 + 论文图表生成 + 终稿。
