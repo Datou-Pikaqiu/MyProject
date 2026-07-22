@@ -84,8 +84,11 @@ Myproject/
 │   │   ├── verifier/               # ✅ 声明验证（Day 5，论文创新点1）
 │   │   │   ├── models.py           #    VerificationResult 验证结果模型
 │   │   │   └── verifier.py         #    硬编码强匹配 + 弃权机制
+│   │   ├── sanitizer/             # ✅ Prompt 注入防护（Day 6，论文创新点2）
+│   │   │   ├── models.py           #    SanitizationResult 净化结果模型
+│   │   │   └── sanitizer.py        #    注入检测 + 净化（5 类 × 23 条正则）
 │   │   ├── scripts/generate_alerts.py  # ✅ 合成数据生成器
-│   │   ├── sanitizer/ rag/ api/    # 待实现（Sprint 2-3）
+│   │   ├── rag/ api/               # 待实现（Sprint 3）
 │   ├── tests/
 │   └── pyproject.toml              # uv + hatchling, py312, pydantic v2, ruff
 ├── datasets/synthetic_alerts.jsonl # ✅ 合成数据（100 条，5 种攻击 + 风暴）
@@ -155,6 +158,6 @@ Myproject/
 - [x] **Day 3**：时窗聚合器（`internal/aggregator/`）+ Go 代码重构（`internal/producer/`）+ AlertContextBundle + 风暴检测。
 - [x] **Day 4**：LLM 接入（DeepSeek API + JSON Mode）+ TriageReport 分诊报告模型 + 提示词模板（系统/用户分离，防注入基础）+ 异步分诊（Semaphore 并发控制）。端到端验证：100 条告警 → 41 Bundle → 41 分诊报告，LLM 完美识别 DDoS 攻击（malicious/ddos/block/0.95）。
 - [x] **Day 5**：verifier 声明验证层（论文创新点1：双重校验）+ 硬编码强匹配 evidence + 弃权机制（0 幻觉）。端到端验证：41 报告 → 38 验证通过（92.7%）+ 3 弃权（7.3%），风暴 Bundle 5/5 evidence 全部验证通过。
-- [ ] **Sprint 2-3（Day 6-15）**：RAG 知识库 + sanitizer（Prompt 注入防护，创新点2）+ 提示词优化。
-- [ ] **Sprint 3（Day 16-21）**：Prompt 注入对抗 + 对比/消融实验。
+- [x] **Day 6**：sanitizer 注入防护（论文创新点2）+ 5 类注入模式（中英双语）× 23 条正则 + 占位符替换。端到端验证：3 条注入告警全被检测（instruction_override / role_hijacking / jailbreak），净化后 LLM 无法被注入操控。
+- [ ] **Sprint 3（Day 7-15）**：RAG 知识库 + 提示词优化 + 对比/消融实验。
 - [ ] **Day 22-25**：实验数据整理 + 论文图表。
