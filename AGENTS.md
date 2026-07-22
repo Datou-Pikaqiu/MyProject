@@ -87,8 +87,12 @@ Myproject/
 │   │   ├── sanitizer/             # ✅ Prompt 注入防护（Day 6，论文创新点2）
 │   │   │   ├── models.py           #    SanitizationResult 净化结果模型
 │   │   │   └── sanitizer.py        #    注入检测 + 净化（5 类 × 23 条正则）
+│   │   ├── rag/                    # ✅ RAG 知识库（Day 7）
+│   │   │   ├── models.py           #    KnowledgeDocument + RAGContext 模型
+│   │   │   ├── knowledge.py        #    10 条电网安全领域文档 + 标签索引
+│   │   │   └── retriever.py        #    关键词提取 + Top-K 检索
 │   │   ├── scripts/generate_alerts.py  # ✅ 合成数据生成器
-│   │   ├── rag/ api/               # 待实现（Sprint 3）
+│   │   ├── api/                    # 待实现
 │   ├── tests/
 │   └── pyproject.toml              # uv + hatchling, py312, pydantic v2, ruff
 ├── datasets/synthetic_alerts.jsonl # ✅ 合成数据（100 条，5 种攻击 + 风暴）
@@ -159,5 +163,6 @@ Myproject/
 - [x] **Day 4**：LLM 接入（DeepSeek API + JSON Mode）+ TriageReport 分诊报告模型 + 提示词模板（系统/用户分离，防注入基础）+ 异步分诊（Semaphore 并发控制）。端到端验证：100 条告警 → 41 Bundle → 41 分诊报告，LLM 完美识别 DDoS 攻击（malicious/ddos/block/0.95）。
 - [x] **Day 5**：verifier 声明验证层（论文创新点1：双重校验）+ 硬编码强匹配 evidence + 弃权机制（0 幻觉）。端到端验证：41 报告 → 38 验证通过（92.7%）+ 3 弃权（7.3%），风暴 Bundle 5/5 evidence 全部验证通过。
 - [x] **Day 6**：sanitizer 注入防护（论文创新点2）+ 5 类注入模式（中英双语）× 23 条正则 + 占位符替换。端到端验证：3 条注入告警全被检测（instruction_override / role_hijacking / jailbreak），净化后 LLM 无法被注入操控。
-- [ ] **Sprint 3（Day 7-15）**：RAG 知识库 + 提示词优化 + 对比/消融实验。
+- [x] **Day 7**：RAG 知识库 + 10 条电网安全领域文档 + 关键词标签检索 + Top-K 注入 prompt。端到端验证：41/41 Bundle 全部检索到领域知识，LLM 推理引用"工程站安全""Modbus 协议"等专业知识。
+- [ ] **Day 8-15**：知识库扩展 + 提示词优化 + 对比/消融实验 + 论文数据整理。
 - [ ] **Day 22-25**：实验数据整理 + 论文图表。

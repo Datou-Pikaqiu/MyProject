@@ -55,11 +55,17 @@ class LLMClient:
 
         self.client = AsyncOpenAI(api_key=api_key, base_url=base_url)
 
-    async def triage(self, bundle: "AlertContextBundle") -> TriageReport | None:
+    async def triage(
+        self, bundle: "AlertContextBundle", rag_context: str | None = None
+    ) -> TriageReport | None:
         """对 AlertContextBundle 进行 LLM 分诊。
+
+        Day 7 新增：rag_context 参数——RAG 检索到的领域知识文本块。
+        不为 None 时会注入到 user prompt 中（在告警数据之前）。
 
         Args:
             bundle: Go 端聚合后发来的告警上下文包
+            rag_context: RAG 检索到的领域知识文本块（可选）
 
         Returns:
             TriageReport 分诊报告；API 调用失败或 JSON 解析失败时返回 None
@@ -69,7 +75,7 @@ class LLMClient:
                 model=self.model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": build_user_prompt(bundle)},
+                    {"role": "user", "content": build_user_prompt(bundle, rag_context)},
                 ],
                 response_format={"type": "json_object"},
                 temperature=0.1,  # 低温度，减少随机性（论文实验要求可复现）

@@ -1,29 +1,33 @@
-"""AI Agent - Subscriber（Day 6 版本，sanitizer + verifier 两层防线）。
+"""AI Agent - Subscriber（Day 7 版本，RAG 知识增强 + sanitizer + verifier）。
 
-Day 6 变化：LLM 分诊前，sanitizer 先净化 Bundle 的外部输入（raw_message 等），
-防止攻击者通过告警文本注入恶意指令。净化后的数据才喂给 LLM。
+Day 7 变化：LLM 分诊前，先用 RAG 检索电网安全领域知识，注入 prompt。
+这使 LLM 能基于专业领域知识（而非仅通用常识）做出更精准的分诊判断。
 
-两层防线（论文创新点 1+2）：
-  sanitizer（创新点2）：LLM 之前 —— 防注入，不让恶意指令进入 LLM
-  verifier （创新点1）：LLM 之后 —— 防幻觉，不让 LLM 编造的证据输出给操作员
+完整防线（论文三个创新点全部就位）：
+  RAG        （Day 7）：LLM 之前 —— 注入领域知识，提升分诊精准度
+  sanitizer  （Day 6）：LLM 之前 —— 防注入，不让恶意指令进入 LLM
+  verifier   （Day 5）：LLM 之后 —— 防幻觉，不让编造证据输出给操作员
 
 演进历史：
   Day 2: alerts.*          → 接收单条 AlertSnapshot，打印
   Day 3: alerts.bundle.*   → 接收聚合 AlertContextBundle，打印聚合上下文
   Day 4: alerts.bundle.*   → 接收 Bundle → 异步调 LLM → 打印分诊报告
-  Day 5: alerts.bundle.*   → 接收 Bundle → LLM 分诊 → verifier 验证 → 输出/弃权
-  Day 6: alerts.bundle.*   → 接收 Bundle → sanitizer 净化 → LLM 分诊 → verifier 验证 → 输出/弃权
+  Day 5: alerts.bundle.*   → LLM 分诊 → verifier 验证 → 输出/弃权
+  Day 6: alerts.bundle.*   → sanitizer 净化 → LLM 分诊 → verifier 验证
+  Day 7: alerts.bundle.*   → sanitizer 净化 → RAG 检索 → LLM 分诊 → verifier 验证
 
 数据流：
   [Go publisher] → [NATS JetStream] → [on_message]
                                             ↓
                                   asyncio.create_task(triage_and_verify)
                                             ↓
-                                  [Sanitizer.sanitize_bundle] → 净化注入内容
+                                  [Sanitizer] → 净化注入内容
                                             ↓
-                                  [LLMClient.triage] → [DeepSeek API]
+                                  [Retriever] → RAG 知识检索
                                             ↓
-                                  [Verifier.verify] → 硬编码强匹配 evidence
+                                  [LLMClient] → [DeepSeek API]（含 RAG 上下文）
+                                            ↓
+                                  [Verifier] → 硬编码强匹配 evidence
                                             ↓
                                   is_valid? → 打印报告 / 标记弃权
 """
@@ -46,6 +50,7 @@ async def main() -> None:
 
     from ai_agent.consumer.models import AlertContextBundle
     from ai_agent.llm.client import LLMClient
+    from ai_agent.rag.retriever import Retriever
     from ai_agent.sanitizer.sanitizer import Sanitizer
     from ai_agent.verifier.verifier import Verifier
 
@@ -69,13 +74,14 @@ async def main() -> None:
         except Exception:
             print(f"[OK] stream {STREAM_NAME} 已被 Go 端创建")
 
-    # 3. 初始化 LLM 客户端 + verifier + sanitizer + 并发控制
+    # 3. 初始化 LLM 客户端 + verifier + sanitizer + RAG + 并发控制
     print("[OK] 初始化 LLM 客户端...")
     llm_client = LLMClient()
     verifier = Verifier()
     sanitizer = Sanitizer()
+    retriever = Retriever(top_k=3)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
-    print(f"[OK] LLM + Verifier + Sanitizer 就绪（最多 {MAX_CONCURRENT_LLM} 个并发分诊）")
+    print(f"[OK] LLM + Verifier + Sanitizer + RAG 就绪（最多 {MAX_CONCURRENT_LLM} 个并发分诊）")
 
     # 4. 统计计数器
     bundles_received = 0
@@ -83,6 +89,8 @@ async def main() -> None:
     reports_verified = 0  # verifier 验证通过的报告数
     reports_abstained = 0  # verifier 弃权的报告数（检测到幻觉）
     injections_detected = 0  # sanitizer 检测到的注入次数
+    rag_retrievals = 0  # RAG 检索次数
+    rag_docs_found = 0  # RAG 检索到的文档总数
     total_alerts = 0
     storm_bundles = 0
     by_max_severity: dict[str, int] = defaultdict(int)
@@ -92,6 +100,7 @@ async def main() -> None:
     # 5. LLM 分诊 + verifier 验证函数（异步，用 semaphore 限制并发）
     async def triage_and_verify(bundle: AlertContextBundle, bundle_num: int) -> None:
         nonlocal reports_generated, reports_verified, reports_abstained, injections_detected
+        nonlocal rag_retrievals, rag_docs_found
 
         async with semaphore:
             # === sanitizer 净化（Day 6 核心新增）===
@@ -102,8 +111,16 @@ async def main() -> None:
                 for r in detected:
                     print(f"    {r}")
 
+            # === RAG 知识检索（Day 7 核心新增）===
+            rag_context = retriever.retrieve(sanitized_bundle)
+            rag_retrievals += 1
+            rag_docs_found += rag_context.document_count
+            if rag_context.documents:
+                print(f"  {rag_context}")
+
             print(f"\n[Bundle #{bundle_num}] 开始 LLM 分诊...")
-            report = await llm_client.triage(sanitized_bundle)
+            rag_block = rag_context.to_prompt_block() if rag_context.documents else None
+            report = await llm_client.triage(sanitized_bundle, rag_context=rag_block)
 
             if report is None:
                 print(f"[Bundle #{bundle_num}] LLM 分诊失败")
@@ -211,6 +228,9 @@ async def main() -> None:
         print(f"  弃权率:           {abstain_rate:.1f}%")
         print("  --- 注入防护 ---")
         print(f"  检测到注入:       {injections_detected}")
+        print("  --- RAG 知识库 ---")
+        print(f"  检索次数:         {rag_retrievals}")
+        print(f"  检索到文档:       {rag_docs_found}")
         print("  --- 分布 ---")
         print(f"  按最高严重度:     {dict(by_max_severity)}")
         print(f"  按分诊分类:       {dict(by_classification)}")
