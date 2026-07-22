@@ -36,13 +36,20 @@ from __future__ import annotations
 
 import asyncio
 import sys
-from collections import defaultdict
-from datetime import datetime
+import time
 
 sys.stdout.reconfigure(line_buffering=True)
 
 STREAM_NAME = "ALERTS"
 MAX_CONCURRENT_LLM = 3  # 最多 3 个并发 LLM 调用（防止 API 限流）
+
+# 实验模式：收够 N 个 Bundle + LLM 全部处理完后自动退出
+# 用法: uv run python -m ai_agent.main --exit-after-bundles=41
+EXIT_AFTER_BUNDLES = 0
+if "--exit-after-bundles" in sys.argv:
+    idx = sys.argv.index("--exit-after-bundles")
+    EXIT_AFTER_BUNDLES = int(sys.argv[idx + 1])
+    print(f"[实验模式] 收到 {EXIT_AFTER_BUNDLES} 个 Bundle 后自动退出")
 
 
 async def main() -> None:
@@ -50,6 +57,7 @@ async def main() -> None:
 
     from ai_agent.consumer.models import AlertContextBundle
     from ai_agent.llm.client import LLMClient
+    from ai_agent.metrics.collector import MetricsCollector
     from ai_agent.rag.retriever import Retriever
     from ai_agent.sanitizer.sanitizer import Sanitizer
     from ai_agent.verifier.verifier import Verifier
@@ -83,51 +91,42 @@ async def main() -> None:
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
     print(f"[OK] LLM + Verifier + Sanitizer + RAG 就绪（最多 {MAX_CONCURRENT_LLM} 个并发分诊）")
 
-    # 4. 统计计数器
-    bundles_received = 0
-    reports_generated = 0  # LLM 生成的报告数
-    reports_verified = 0  # verifier 验证通过的报告数
-    reports_abstained = 0  # verifier 弃权的报告数（检测到幻觉）
-    injections_detected = 0  # sanitizer 检测到的注入次数
-    rag_retrievals = 0  # RAG 检索次数
-    rag_docs_found = 0  # RAG 检索到的文档总数
-    total_alerts = 0
-    storm_bundles = 0
-    by_max_severity: dict[str, int] = defaultdict(int)
-    by_classification: dict[str, int] = defaultdict(int)
-    start_time = datetime.now()
+    # 4. 指标采集器 + pending task 追踪
+    metrics = MetricsCollector()
+    pending_tasks: set[asyncio.Task[None]] = set()
+    exit_event = asyncio.Event()
 
     # 5. LLM 分诊 + verifier 验证函数（异步，用 semaphore 限制并发）
     async def triage_and_verify(bundle: AlertContextBundle, bundle_num: int) -> None:
-        nonlocal reports_generated, reports_verified, reports_abstained, injections_detected
-        nonlocal rag_retrievals, rag_docs_found
+        nonlocal metrics
 
         async with semaphore:
             # === sanitizer 净化（Day 6 核心新增）===
             sanitized_bundle, detected = sanitizer.sanitize_bundle(bundle)
             if detected:
-                injections_detected += len(detected)
+                metrics.record_injections(len(detected))
                 print("  [Sanitizer] 检测到注入:")
                 for r in detected:
                     print(f"    {r}")
 
             # === RAG 知识检索（Day 7 核心新增）===
             rag_context = retriever.retrieve(sanitized_bundle)
-            rag_retrievals += 1
-            rag_docs_found += rag_context.document_count
+            metrics.record_rag(rag_context.document_count)
             if rag_context.documents:
                 print(f"  {rag_context}")
 
             print(f"\n[Bundle #{bundle_num}] 开始 LLM 分诊...")
             rag_block = rag_context.to_prompt_block() if rag_context.documents else None
+            t0 = time.monotonic()
             report = await llm_client.triage(sanitized_bundle, rag_context=rag_block)
 
             if report is None:
                 print(f"[Bundle #{bundle_num}] LLM 分诊失败")
                 return
 
-            reports_generated += 1
-            by_classification[report.classification.value] += 1
+            latency_ms = (time.monotonic() - t0) * 1000
+            metrics.record_llm_call(prompt_tokens=0, completion_tokens=0, latency_ms=latency_ms)
+            metrics.record_classification(report.classification.value)
 
             # === verifier 验证（Day 5 核心新增）===
             # 用净化后的 Bundle 验证（LLM 只能引用净化后的数据）
@@ -135,7 +134,7 @@ async def main() -> None:
 
             if result.is_valid:
                 # 验证通过 → 输出报告
-                reports_verified += 1
+                metrics.record_verifier(True)
                 print(f"\n{'=' * 60}")
                 print(f"[分诊报告-已验证] Bundle #{bundle_num} ({bundle.bundle_id})")
                 print(f"{'=' * 60}")
@@ -152,7 +151,7 @@ async def main() -> None:
                 print(f"{'=' * 60}")
             else:
                 # 验证失败 → 弃权（0 幻觉机制）
-                reports_abstained += 1
+                metrics.record_verifier(False)
                 print(f"\n{'=' * 60}")
                 print(f"[弃权-检测到幻觉] Bundle #{bundle_num} ({bundle.bundle_id})")
                 print(f"{'=' * 60}")
@@ -169,7 +168,7 @@ async def main() -> None:
 
     # 6. 消息回调（收到 Bundle 后异步启动 LLM 分诊 + verifier）
     async def on_message(msg) -> None:
-        nonlocal bundles_received, total_alerts, storm_bundles
+        nonlocal metrics
 
         try:
             bundle = AlertContextBundle.model_validate_json(msg.data)
@@ -177,19 +176,18 @@ async def main() -> None:
             print(f"[!] 解析失败 (subject={msg.subject}): {e}")
             return
 
-        bundles_received += 1
-        total_alerts += bundle.alert_count
-        by_max_severity[bundle.max_severity.value] += 1
-
-        if bundle.is_alert_storm:
-            storm_bundles += 1
+        metrics.record_bundle(
+            alert_count=bundle.alert_count,
+            severity=bundle.max_severity.value,
+            is_storm=bundle.is_alert_storm,
+        )
 
         # 打印 Bundle 摘要（保留 Day 3 的功能）
         storm_tag = " [STORM]" if bundle.is_alert_storm else ""
         window_ms = (bundle.window_end - bundle.window_start).total_seconds() * 1000
 
         print(
-            f"\n[Bundle #{bundles_received:3d}] {bundle.bundle_id}\n"
+            f"\n[Bundle #{metrics.bundles_received:3d}] {bundle.bundle_id}\n"
             f"  告警数: {bundle.alert_count} | 最高严重度: "
             f"{bundle.max_severity.value:8s}{storm_tag}\n"
             f"  窗口时长: {window_ms:.0f}ms | 平均速率: {bundle.avg_packet_rate:.0f} pps"
@@ -202,41 +200,30 @@ async def main() -> None:
             print(f"  总连接失败: {bundle.total_failed_conn}")
 
         # 异步启动 LLM 分诊 + verifier 验证（不阻塞 callback）
-        asyncio.create_task(triage_and_verify(bundle, bundles_received))
+        task = asyncio.create_task(triage_and_verify(bundle, metrics.bundles_received))
+        pending_tasks.add(task)
+        task.add_done_callback(pending_tasks.discard)
+
+        # 实验模式：收够指定 Bundle 数后触发退出
+        if EXIT_AFTER_BUNDLES > 0 and metrics.bundles_received >= EXIT_AFTER_BUNDLES:
+            exit_event.set()
 
     # 7. 订阅 alerts.bundle.*
     await js.subscribe("alerts.bundle.*", cb=on_message, queue="ai-agent")
     print("[OK] 已订阅 alerts.bundle.* (JetStream)，等待 Go 端发布 Bundle...")
     print("     (按 Ctrl+C 退出)\n")
 
-    # 8. 保持运行
-    try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        elapsed = (datetime.now() - start_time).total_seconds()
-        abstain_rate = (
-            reports_abstained / reports_generated * 100 if reports_generated > 0 else 0
-        )
-        print("\n\n[退出] 统计汇总")
-        print(f"  接收 Bundle:      {bundles_received}")
-        print(f"  告警总数:         {total_alerts}")
-        print(f"  风暴 Bundle:      {storm_bundles}")
-        print("  --- LLM 分诊 ---")
-        print(f"  生成报告:         {reports_generated}")
-        print(f"  验证通过:         {reports_verified}")
-        print(f"  弃权（幻觉）:     {reports_abstained}")
-        print(f"  弃权率:           {abstain_rate:.1f}%")
-        print("  --- 注入防护 ---")
-        print(f"  检测到注入:       {injections_detected}")
-        print("  --- RAG 知识库 ---")
-        print(f"  检索次数:         {rag_retrievals}")
-        print(f"  检索到文档:       {rag_docs_found}")
-        print("  --- 分布 ---")
-        print(f"  按最高严重度:     {dict(by_max_severity)}")
-        print(f"  按分诊分类:       {dict(by_classification)}")
-        if elapsed > 0:
-            print(f"  耗时:             {elapsed:.1f}s")
-        await nc.drain()
+    # 8. 保持运行（实验模式下由 exit_event 触发退出）
+    await exit_event.wait()
+
+    # 等待所有 pending LLM 任务完成
+    if pending_tasks:
+        print(f"\n[等待] {len(pending_tasks)} 个 LLM 分诊进行中，等待完成...")
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+    metrics.finish()
+    print("\n\n" + metrics.to_text())
+    await nc.drain()
 
 
 if __name__ == "__main__":

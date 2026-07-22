@@ -4,9 +4,9 @@
 
 硕士论文工程：**Real-Time AI-Assisted Alert Triage for Smart-Grid Networks Using Go-Based Telemetry and Evidence-Grounded LLMs**。
 
-- 双轨架构：Go 快车道（时窗聚合 + JetStream 发布）+ Python 慢车道（RAG + 声明验证），NATS JetStream 解耦。
+- 双轨架构：Go 快车道（时窗聚合 + JetStream 发布）+ Python 慢车道（sanitizer → RAG → LLM → verifier → metrics），NATS JetStream 解耦。
 - 技术栈：Go 1.25（`nats.go`）+ Python 3.12（`uv` + `pydantic v2` + `ruff`）+ NATS JetStream（`nats:2.10-alpine`）。
-- 代码在 `go-telemetry/`（Go）和 `ai-agent/`（Python）。Day 3 已完成时窗聚合，当前进入 Sprint 2（LLM 接入）。
+- 代码在 `go-telemetry/`（Go）和 `ai-agent/`（Python）。Day 8 已完成全链路指标采集。
 
 ## 系统架构与数据流
 
@@ -16,11 +16,11 @@
                                     |  Publish: alerts.bundle.<severity>
                               [NATS JetStream]
                                     |  Subscribe: alerts.bundle.* (queue=ai-agent)
-                           Python(consumer) -> Python(sanitizer)
+                           Python(consumer) → Python(sanitizer)
                                     |
-                           Python(rag) -> Python(llm) -> Python(verifier)
+                           Python(rag) → Python(llm) → Python(verifier)
                                     |
-                           Python(feedback) -> 分级工单 / 反向通知 Go
+                           Python(metrics) → 指标报表（文本 + JSON）
 ```
 
 - **两个核心契约**（都在 `pkg/contract/` + `consumer/models.py`）：
@@ -30,10 +30,10 @@
   - `alerts.<severity>` — 单条告警（Day 1-2，目前 producer 不再用）
   - `alerts.bundle.<severity>` — 聚合 Bundle（Day 3+，当前使用）
   - stream 名 `ALERTS`，subjects=`["alerts.*", "alerts.bundle.*"]`，消费组 `queue="ai-agent"`
-- **三个创新点（导师关注，改动谨慎）**：
-  1. 双重校验（`verifier/`）：LLM 输出 JSON + Python 硬编码强匹配溯源，0 幻觉弃权机制。
-  2. Prompt 注入防护（`sanitizer/`）：外部输入只作只读数据块，永不作指令。
-  3. 时窗聚合降噪（`aggregator/` ✅ Day 3 已实现）：滑动窗口打包告警上下文快照，防告警风暴冲垮 LLM。
+- **三个创新点（论文核心，均已实现）**：
+  1. 双重校验（`verifier/` ✅ Day 5）：LLM 输出 JSON + Python 硬编码强匹配溯源，0 幻觉弃权机制。
+  2. Prompt 注入防护（`sanitizer/` ✅ Day 6）：外部输入只作只读数据块，永不作指令。
+  3. 时窗聚合降噪（`aggregator/` ✅ Day 3）：滑动窗口打包告警上下文快照，防告警风暴冲垮 LLM。
 
 ## 常用命令
 
@@ -53,9 +53,13 @@ go test ./...
 
 # Python（workdir: ai-agent/，只用 uv）
 uv sync                                    # 同步依赖
-uv run python -m ai_agent.main             # 运行 subscriber（订阅 Bundle）
+uv run python -m ai_agent.main             # 运行 subscriber（订阅 Bundle，Ctrl+C 退出）
+uv run python -m ai_agent.main --exit-after-bundles=41  # 实验模式：收 41 Bundle 后自动退出 + 打印指标
 uv run python -m ai_agent.scripts.generate_alerts  # 生成合成数据
-uv run ruff check src tests && uv run ruff format src tests
+uv run ruff check src tests; uv run ruff format src tests
+uv run python tests/test_verifier.py       # verifier 单测
+uv run python tests/test_sanitizer.py      # sanitizer 单测
+uv run python tests/test_rag.py            # RAG 单测
 ```
 
 **端到端联调**：终端 1 起 NATS，终端 2 `uv run python -m ai_agent.main`，终端 3 `go run ./cmd/telemetry --file ../datasets/synthetic_alerts.jsonl --interval 200ms`，预期终端 2 打印 41 个 Bundle（含 1 个 `[STORM]`）。
@@ -75,22 +79,24 @@ Myproject/
 │   └── go.mod                      # module 名 = masterproject
 ├── ai-agent/
 │   ├── src/ai_agent/
-│   │   ├── main.py                 # 入口（订阅 Bundle + 异步 LLM 分诊）
+│   │   ├── main.py                 # 入口（订阅 → sanitizer → RAG → LLM → verifier → metrics）
 │   │   ├── consumer/models.py      # ✅ AlertSnapshot + AlertContextBundle
 │   │   ├── llm/                    # ✅ LLM 分诊（Day 4）
 │   │   │   ├── models.py           #    TriageReport 分诊报告模型
 │   │   │   ├── prompts.py          #    提示词模板（系统/用户分离）
 │   │   │   └── client.py           #    DeepSeek API 异步客户端
-│   │   ├── verifier/               # ✅ 声明验证（Day 5，论文创新点1）
+│   │   ├── verifier/               # ✅ 声明验证（Day 5，创新点1）
 │   │   │   ├── models.py           #    VerificationResult 验证结果模型
 │   │   │   └── verifier.py         #    硬编码强匹配 + 弃权机制
-│   │   ├── sanitizer/             # ✅ Prompt 注入防护（Day 6，论文创新点2）
+│   │   ├── sanitizer/             # ✅ Prompt 注入防护（Day 6，创新点2）
 │   │   │   ├── models.py           #    SanitizationResult 净化结果模型
 │   │   │   └── sanitizer.py        #    注入检测 + 净化（5 类 × 23 条正则）
 │   │   ├── rag/                    # ✅ RAG 知识库（Day 7）
 │   │   │   ├── models.py           #    KnowledgeDocument + RAGContext 模型
 │   │   │   ├── knowledge.py        #    10 条电网安全领域文档 + 标签索引
 │   │   │   └── retriever.py        #    关键词提取 + Top-K 检索
+│   │   ├── metrics/                # ✅ 指标采集（Day 8）
+│   │   │   └── collector.py        #    MetricsCollector + 文本/JSON 报表
 │   │   ├── scripts/generate_alerts.py  # ✅ 合成数据生成器
 │   │   ├── api/                    # 待实现
 │   ├── tests/
@@ -164,5 +170,5 @@ Myproject/
 - [x] **Day 5**：verifier 声明验证层（论文创新点1：双重校验）+ 硬编码强匹配 evidence + 弃权机制（0 幻觉）。端到端验证：41 报告 → 38 验证通过（92.7%）+ 3 弃权（7.3%），风暴 Bundle 5/5 evidence 全部验证通过。
 - [x] **Day 6**：sanitizer 注入防护（论文创新点2）+ 5 类注入模式（中英双语）× 23 条正则 + 占位符替换。端到端验证：3 条注入告警全被检测（instruction_override / role_hijacking / jailbreak），净化后 LLM 无法被注入操控。
 - [x] **Day 7**：RAG 知识库 + 10 条电网安全领域文档 + 关键词标签检索 + Top-K 注入 prompt。端到端验证：41/41 Bundle 全部检索到领域知识，LLM 推理引用"工程站安全""Modbus 协议"等专业知识。
-- [ ] **Day 8-15**：知识库扩展 + 提示词优化 + 对比/消融实验 + 论文数据整理。
-- [ ] **Day 22-25**：实验数据整理 + 论文图表。
+- [x] **Day 8**：metrics 指标采集模块 + 结构化报表（文本/JSON）+ NATS 管道完整实验。100 条告警 → 41 Bundle（压缩比 2.4:1，降噪 59%），LLM 平均延迟 1892ms，verifier 弃权率 2.4%（1/41），RAG 命中率 3.0 条/Bundle。新增 `--exit-after-bundles=N` 实验模式。
+- [ ] **Day 9+**：SWaT 数据实验 + 论文图表 + 终稿。
