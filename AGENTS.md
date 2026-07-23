@@ -76,8 +76,11 @@ Myproject/
 │   ├── internal/
 │   │   ├── aggregator/             # ✅ 时窗聚合器（Day 3）
 │   │   ├── producer/               # ✅ JetStream 发布（Day 3）
-│   │   ├── capture/                # 待实现（PCAP 重放）
-│   │   └── features/               # 待实现（特征提取）
+│   │   ├── capture/                # ✅ 数据采集层（Day 10）
+│   │   │   ├── reader.go           #    EventReader 接口 + JSONLReader
+│   │   │   └── pcap.go             #    PCAP 占位（SWaT 替换）
+│   │   ├── features/               # ✅ 特征提取层（Day 10）
+│   │   │   └── extractor.go        #    RawEvent → AlertSnapshot
 │   ├── pkg/contract/               # ✅ alert.go + bundle.go
 │   └── go.mod                      # module 名 = masterproject
 ├── ai-agent/
@@ -175,4 +178,5 @@ Myproject/
 - [x] **Day 7**：RAG 知识库 + 10 条电网安全领域文档 + 关键词标签检索 + Top-K 注入 prompt。端到端验证：41/41 Bundle 全部检索到领域知识，LLM 推理引用"工程站安全""Modbus 协议"等专业知识。
 - [x] **Day 8**：metrics 指标采集模块 + 结构化报表（文本/JSON）+ NATS 管道完整实验。100 条告警 → 41 Bundle（压缩比 2.4:1，降噪 59%），LLM 平均延迟 1892ms，verifier 弃权率 2.4%（1/41），RAG 命中率 3.0 条/Bundle。新增 `--exit-after-bundles=N` 实验模式。
 - [x] **Day 9**：修复 LLM token 追踪（`client.last_*_tokens`）+ 消融实验框架（`--no-rag` / `--no-verifier`）+ 自动运行器 `scripts/run_ablation.py`（串行 3 组实验 → 对比表 + JSON）。
-- [ ] **Day 10+**：SWaT 数据实验 + 论文图表生成 + 终稿。
+- [x] **Day 10**：Go capture 层（EventReader 接口 + JSONLReader + PCAP 占位）+ Go features 层（Extractor: RawEvent → AlertSnapshot）+ main.go 重构为论文四层管道。
+- [ ] **Day 11+**：SWaT 数据实验 + 论文图表生成 + 终稿。

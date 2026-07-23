@@ -1,21 +1,24 @@
 // Package main 是 Go 遥测服务的入口。
 //
-// Day 3：管道组装 = 读 JSONL → 时窗聚合 → JetStream 发布 Bundle
-// main.go 只负责组装管道，逻辑拆到 internal/ 包里：
-//   - internal/aggregator/ 时窗聚合（提案创新点）
-//   - internal/producer/   JetStream 发布
+// 管道组装（论文架构）：
+//   capture.Read() → features.Extract() → aggregator.Add() → producer.PublishBundle()
+//
+// 各层职责：
+//   - internal/capture/   数据采集（JSONL / PCAP）
+//   - internal/features/  特征提取（RawEvent → AlertSnapshot）
+//   - internal/aggregator/ 时窗聚合（AlertSnapshot → AlertContextBundle）
+//   - internal/producer/  JetStream 发布
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"masterproject/internal/aggregator"
+	"masterproject/internal/capture"
+	"masterproject/internal/features"
 	"masterproject/internal/producer"
 	"masterproject/pkg/contract"
 )
@@ -35,52 +38,61 @@ func main() {
 	defer p.Close()
 	fmt.Printf("[OK] Producer 就绪，窗口 %v / 风暴阈值 %d 条\n", *windowSize, *maxAlerts)
 
-	// 2. 创建聚合器
+	// 2. 创建数据采集器（capture 层）
+	reader, err := capture.NewJSONLReader(*filePath)
+	if err != nil {
+		log.Fatalf("[X] 创建 Reader 失败: %v", err)
+	}
+	defer reader.Close()
+
+	// 3. 创建特征提取器（features 层）
+	extractor := features.NewExtractor()
+
+	// 4. 创建聚合器（aggregator 层）
 	agg := aggregator.NewAggregator(*windowSize, *maxAlerts)
 
-	// 3. 打开 JSONL 文件
-	file, err := os.Open(*filePath)
-	if err != nil {
-		log.Fatalf("[X] 打开文件失败: %v", err)
-	}
-	defer file.Close()
-
-	// 4. 逐行读取 → 聚合 → 发布
-	scanner := bufio.NewScanner(file)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-
-	totalAlerts := 0     // 读取的告警总数
-	bundlesSent := 0     // 发送的 Bundle 数
-	stormBundles := 0    // 风暴 Bundle 数
+	// 5. 管道主循环: capture → features → aggregate → publish
+	totalAlerts := 0
+	bundlesSent := 0
+	stormBundles := 0
 	startTime := time.Now()
 
-	for scanner.Scan() {
-		var alert contract.AlertSnapshot
-		if err := json.Unmarshal(scanner.Bytes(), &alert); err != nil {
-			log.Printf("[!] 解析失败: %v", err)
-			continue
+	for {
+		// capture 层：读取事件
+		events, err := reader.Read()
+		if err != nil {
+			log.Fatalf("[X] 读取事件失败: %v", err)
+		}
+		if events == nil {
+			break // EOF
 		}
 
-		totalAlerts++
+		// features 层：特征提取
+		snapshots := extractor.Extract(events)
 
-		// 加入聚合器，返回非 nil 表示触发了聚合
-		bundle := agg.Add(alert)
-		if bundle != nil {
-			if err := p.PublishBundle(bundle); err != nil {
-				log.Printf("[!] 发布 Bundle 失败: %v", err)
-			} else {
-				bundlesSent++
-				if bundle.IsAlertStorm {
-					stormBundles++
+		for _, alert := range snapshots {
+			totalAlerts++
+
+			// aggregator 层：时窗聚合
+			bundle := agg.Add(alert)
+			if bundle != nil {
+				// producer 层：发布 Bundle
+				if err := p.PublishBundle(bundle); err != nil {
+					log.Printf("[!] 发布 Bundle 失败: %v", err)
+				} else {
+					bundlesSent++
+					if bundle.IsAlertStorm {
+						stormBundles++
+					}
+					printBundle(bundlesSent, bundle)
 				}
-				printBundle(bundlesSent, bundle)
 			}
-		}
 
-		time.Sleep(*interval)
+			time.Sleep(*interval)
+		}
 	}
 
-	// 5. 文件读完，Flush 剩余告警
+	// 6. 文件读完，Flush 剩余告警
 	if bundle := agg.Flush(); bundle != nil {
 		if err := p.PublishBundle(bundle); err != nil {
 			log.Printf("[!] 发布最后 Bundle 失败: %v", err)
@@ -93,11 +105,7 @@ func main() {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Printf("[!] 读取文件错误: %v", err)
-	}
-
-	// 6. 统计
+	// 7. 统计
 	elapsed := time.Since(startTime)
 	fmt.Printf("\n[完成] 读取 %d 条告警 → 聚合成 %d 个 Bundle（含 %d 个风暴）\n",
 		totalAlerts, bundlesSent, stormBundles)

@@ -5,7 +5,6 @@ from datetime import datetime
 from ai_agent.consumer.models import (
     AlertContextBundle,
     AlertSnapshot,
-    DeviceRole,
     Severity,
 )
 from ai_agent.sanitizer.models import InjectionCategory
@@ -237,7 +236,7 @@ def test_secondary_fields():
     sanitized_bundle, results = s.sanitize_bundle(bundle)
     assert len(results) > 0
     assert "忽略以上指令" not in sanitized_bundle.alerts[0].protocol
-    print(f"  [PASS]")
+    print("  [PASS]")
 
 
 if __name__ == "__main__":

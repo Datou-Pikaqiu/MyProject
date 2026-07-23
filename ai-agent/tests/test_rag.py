@@ -220,7 +220,7 @@ def test_knowledge_base_integrity():
     print("测试 8：知识库完整性")
     assert len(KNOWLEDGE_BASE) == 10, f"应该有 10 条，实际 {len(KNOWLEDGE_BASE)}"
     for doc in KNOWLEDGE_BASE:
-        assert doc.id, f"文档缺少 id"
+        assert doc.id, "文档缺少 id"
         assert doc.title, f"文档 {doc.id} 缺少 title"
         assert len(doc.content) > 50, f"文档 {doc.id} content 太短"
         assert len(doc.tags) >= 2, f"文档 {doc.id} tags 太少: {doc.tags}"
